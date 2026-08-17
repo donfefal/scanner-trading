@@ -1,7 +1,7 @@
 import streamlit as st
 import requests
 import pandas as pd
-import pandas_ta as ta
+import ta
 
 st.set_page_config(page_title="Scanner Forex/Crypto", page_icon="📊", layout="wide")
 
@@ -41,10 +41,10 @@ def analyze(symbol):
     swept_low = b_curr['low'] < b_prev['low'] and b_curr['close'] > prev_mid and b_curr['close'] > b_curr['open']
     swept_high = b_curr['high'] > b_prev['high'] and b_curr['close'] < prev_mid and b_curr['close'] < b_curr['open']
 
-    df_ltf['EMA200'] = ta.ema(df_ltf['close'], length=200)
-    df_ltf['EMA800'] = ta.ema(df_ltf['close'], length=800)
-    df_ltf['RSI'] = ta.rsi(df_ltf['close'], length=14)
-    df_ltf['Base'] = ta.sma(df_ltf['RSI'], length=14)
+    df_ltf['EMA200'] = ta.trend.ema_indicator(df_ltf['close'], window=200)
+    df_ltf['EMA800'] = ta.trend.ema_indicator(df_ltf['close'], window=800)
+    df_ltf['RSI'] = ta.momentum.rsi(df_ltf['close'], window=14)
+    df_ltf['Base'] = ta.trend.sma_indicator(df_ltf['RSI'], window=14)
 
     price = df_ltf['close'].iloc[-1]
     e200, e800 = df_ltf['EMA200'].iloc[-1], df_ltf['EMA800'].iloc[-1]
@@ -74,3 +74,4 @@ if API_KEY:
     st.dataframe(pd.DataFrame(data), use_container_width=True)
 else:
     st.warning("Insère ta clé Twelve Data dans le menu à gauche pour afficher les résultats.")
+                  
