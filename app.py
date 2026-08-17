@@ -4,24 +4,25 @@ import pandas as pd
 import ta
 import time
 
-st.set_page_config(page_title="Scanner Forex/Crypto + Telegram", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Scanner Multi-Séquences MTF", page_icon="📊", layout="wide")
 
-st.title("📊 Scanner Reversal Multi-Timeframe")
-st.caption("Filtres : Sweep HTF + Structure W/M LTF + Retest Neckline + EMA 200/800 + RSI")
+st.title("📊 Scanner Reversal - Alignement HTF, TDI & Continuation")
+st.caption("Cascade : Clôture HTF -> Structure M/W & TDI -> Retest OU Bougie de Continuation")
 
-# Secrets
+# Secrets Streamlit Cloud
 API_KEY = st.secrets.get("TWELVEDATA_API_KEY", "")
 TELEGRAM_TOKEN = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = st.secrets.get("TELEGRAM_CHAT_ID", "")
 
-st.sidebar.header("⚙️ Configuration")
-HTF = st.sidebar.selectbox("Timeframe Supérieur (HTF)", ["1day", "4h", "1week", "1month"])
+st.sidebar.header("⚙️ Configuration HTF")
+HTF = st.sidebar.selectbox("Clôture HTF (Contexte)", ["1month", "1week", "1day", "4h"])
 
-TIMEFRAME_MAP = {
-    "1month": "1day",
-    "1week": "4h",
-    "1day": "1h",
-    "4h": "15min"
+# Mapping exact de la chronologie TDI
+MTF_MAP = {
+    "1month": {"struct_tdi": "1day",  "entry": "1h"},
+    "1week":  {"struct_tdi": "4h",    "entry": "15min"},
+    "1day":   {"struct_tdi": "1h",    "entry": "15min"},
+    "4h":     {"struct_tdi": "15min", "entry": "5min"}
 }
 
 ALL_PAIRS = [
@@ -61,130 +62,161 @@ def fetch_data(symbol, interval):
     except: 
         return pd.DataFrame()
 
-def check_pattern_w_m(df_ltf):
-    """
-    Détection de structure W (Double Bottom) ou M (Double Top) et du retest de la ligne de cou (Neckline)
-    """
-    if len(df_ltf) < 20:
-        return None, None
-
-    recent = df_ltf.tail(20).reset_index(drop=True)
-    current_price = recent['close'].iloc[-1]
+def analyze_sequences(symbol):
+    tf_struct = MTF_MAP[HTF]["struct_tdi"]
+    tf_entry = MTF_MAP[HTF]["entry"]
     
-    # Recherche des creux et sommets locaux
-    min1 = recent['low'].iloc[:-10].min()
-    min2 = recent['low'].iloc[-10:].min()
-    max_between_mins = recent['high'].iloc[recent['low'].idxmin():].max() if not recent['low'].empty else None
-
-    max1 = recent['high'].iloc[:-10].max()
-    max2 = recent['high'].iloc[-10:].max()
-    min_between_maxs = recent['low'].iloc[recent['high'].idxmax():].min() if not recent['high'].empty else None
-
-    # Condition W (Double Bottom + Retest Ligne de cou)
-    w_shape = abs(min1 - min2) / min1 < 0.003  # Creux à un niveau similaire
-    if w_shape and max_between_mins:
-        neckline = max_between_mins
-        # Retest de la ligne de cou : le prix est proche ou rebondit sur la ligne de cou après l'avoir cassée
-        retest_w = current_price >= (neckline * 0.998) and current_price <= (neckline * 1.003)
-        if retest_w:
-            return "W (Double Bottom)", neckline
-
-    # Condition M (Double Top + Retest Ligne de cou)
-    m_shape = abs(max1 - max2) / max1 < 0.003  # Sommets à un niveau similaire
-    if m_shape and min_between_maxs:
-        neckline = min_between_maxs
-        retest_m = current_price <= (neckline * 1.002) and current_price >= (neckline * 0.997)
-        if retest_m:
-            return "M (Double Top)", neckline
-
-    return None, None
-
-def analyze(symbol):
-    ltf = TIMEFRAME_MAP.get(HTF, "15min")
     df_htf = fetch_data(symbol, HTF)
-    df_ltf = fetch_data(symbol, ltf)
+    df_struct = fetch_data(symbol, tf_struct)
+    df_entry = fetch_data(symbol, tf_entry)
 
-    if df_htf.empty or df_ltf.empty or len(df_htf) < 3:
-        return {"Paire": symbol, "Signal": "NEUTRE", "Prix": "-", "Pattern LTF": "-", "Raison": "Données manquantes"}
+    if df_htf.empty or df_struct.empty or df_entry.empty:
+        return None
 
-    # 1. Sweep HTF
+    # Indicateurs TDI calculés strictement sur le Timeframe de Structure (D1, H4, H1 ou M15)
+    df_struct['RSI'] = ta.momentum.rsi(df_struct['close'], window=14)
+    df_struct['Base'] = ta.trend.sma_indicator(df_struct['RSI'], window=14)
+    
+    # 1. Clôture Bougie HTF / Sweep
     b_prev, b_curr = df_htf.iloc[-2], df_htf.iloc[-1]
     prev_mid = (b_prev['open'] + b_prev['close']) / 2
+    swept_low = b_curr['low'] < b_prev['low'] and b_curr['close'] > prev_mid
+    swept_high = b_curr['high'] > b_prev['high'] and b_curr['close'] < prev_mid
+
+    step1 = f"✅ Clôture/Sweep Bas ({HTF})" if swept_low else (f"✅ Clôture/Sweep Haut ({HTF})" if swept_high else "❌ Non")
+    bias = "ACHAT" if swept_low else ("VENTE" if swept_high else "NEUTRE")
+
+    # 2. Structure M ou W sur le Timeframe de Structure
+    recent_s = df_struct.tail(30).reset_index(drop=True)
+    price = df_entry['close'].iloc[-1]
     
-    swept_low = b_curr['low'] < b_prev['low'] and b_curr['close'] > prev_mid and b_curr['close'] > b_curr['open']
-    swept_high = b_curr['high'] > b_prev['high'] and b_curr['close'] < prev_mid and b_curr['close'] < b_curr['open']
+    max1_idx, max2_idx = recent_s['high'].iloc[:-12].idxmax(), recent_s['high'].iloc[-12:].idxmax()
+    max1, max2 = recent_s['high'].iloc[max1_idx], recent_s['high'].iloc[max2_idx]
+    min_between = recent_s['low'].iloc[max1_idx:max2_idx+1].min() if max1_idx < max2_idx else None
 
-    # 2. Indicators LTF
-    df_ltf['EMA200'] = ta.trend.ema_indicator(df_ltf['close'], window=200)
-    df_ltf['EMA800'] = ta.trend.ema_indicator(df_ltf['close'], window=800)
-    df_ltf['RSI'] = ta.momentum.rsi(df_ltf['close'], window=14)
-    df_ltf['Base'] = ta.trend.sma_indicator(df_ltf['RSI'], window=14)
+    min1_idx, min2_idx = recent_s['low'].iloc[:-12].idxmin(), recent_s['low'].iloc[-12:].idxmin()
+    min1, min2 = recent_s['low'].iloc[min1_idx], recent_s['low'].iloc[min2_idx]
+    max_between = recent_s['high'].iloc[min1_idx:min2_idx+1].max() if min1_idx < min2_idx else None
 
-    price = df_ltf['close'].iloc[-1]
-    e200, e800 = df_ltf['EMA200'].iloc[-1], df_ltf['EMA800'].iloc[-1]
-    rsi_c, base_c = df_ltf['RSI'].iloc[-1], df_ltf['Base'].iloc[-1]
-    rsi_p, base_p = df_ltf['RSI'].iloc[-2], df_ltf['Base'].iloc[-2]
+    is_m = (abs(max1 - max2) / max1 < 0.004) and min_between is not None
+    is_w = (abs(min1 - min2) / min1 < 0.004) and max_between is not None
 
-    ema_bull = price > e200 and price > e800
-    ema_bear = price < e200 and price < e800
+    step2 = f"M sur {tf_struct}" if is_m else (f"W sur {tf_struct}" if is_w else "❌ Non")
 
-    rsi_buy = (rsi_p <= base_p and rsi_c >= base_c) or ((base_c - rsi_c) <= 2.5 and rsi_c < base_c)
-    rsi_sell = (rsi_p >= base_p and rsi_c <= base_c) or ((rsi_c - base_c) <= 2.5 and rsi_c > base_c)
-
-    # 3. Structure W/M & Retest
-    pattern, neckline = check_pattern_w_m(df_ltf)
-
-    # Signal ACHAT : Sweep Low HTF + Pattern W LTF + Tendance EMA OK + RSI OK
-    if swept_low and pattern == "W (Double Bottom)" and ema_bull and rsi_buy:
-        return {
-            "Paire": symbol, "Signal": "🚀 ACHAT", "Prix": price, 
-            "Pattern LTF": f"W Retest ({neckline:.5f})", "RSI": f"{rsi_c:.1f}/{base_c:.1f}", 
-            "Raison": f"Sweep Low {HTF} + Retest W {ltf}"
-        }
+    # 3. TDI : Traversée du RSI sur la Baseline (par le bas pour W, par le haut pour M)
+    rsi_c, base_c = df_struct['RSI'].iloc[-1], df_struct['Base'].iloc[-1]
+    rsi_p, base_p = df_struct['RSI'].iloc[-2], df_struct['Base'].iloc[-2]
     
-    # Signal VENTE : Sweep High HTF + Pattern M LTF + Tendance EMA OK + RSI OK
-    elif swept_high and pattern == "M (Double Top)" and ema_bear and rsi_sell:
-        return {
-            "Paire": symbol, "Signal": "🔻 VENTE", "Prix": price, 
-            "Pattern LTF": f"M Retest ({neckline:.5f})", "RSI": f"{rsi_c:.1f}/{base_c:.1f}", 
-            "Raison": f"Sweep High {HTF} + Retest M {ltf}"
-        }
+    rsi_cross_up = (rsi_p <= base_p and rsi_c > base_c)
+    rsi_cross_down = (rsi_p >= base_p and rsi_c < base_c)
+    step3 = f"✅ RSI traverse Baseline HAUSSE ({tf_struct})" if rsi_cross_up else (f"✅ RSI traverse Baseline BAISSE ({tf_struct})" if rsi_cross_down else f"🔄 Proche ({rsi_c:.1f}/{base_c:.1f})")
 
-    return {"Paire": symbol, "Signal": "NEUTRE", "Prix": price, "Pattern LTF": pattern if pattern else "-", "RSI": f"{rsi_c:.1f}/{base_c:.1f}", "Raison": "Conditions non alignées"}
+    # 4 & 5. Retest OU Bougie de Continuation (Impulsion Sèche)
+    neckline = min_between if is_m else (max_between if is_w else None)
+    step4 = "❌ Non"
+    step5 = "❌ Non"
+
+    if neckline:
+        dist = abs(price - neckline) / neckline
+        
+        # Caractéristiques de la dernière bougie d'entrée LTF
+        c_open = df_entry['open'].iloc[-1]
+        c_close = df_entry['close'].iloc[-1]
+        c_high = df_entry['high'].iloc[-1]
+        c_low = df_entry['low'].iloc[-1]
+        body_ratio = abs(c_close - c_open) / (c_high - c_low) if (c_high - c_low) > 0 else 0
+
+        # Scénario A : Retest classique de la neckline
+        if dist <= 0.002:
+            step4 = f"✅ Retest Neckline ({neckline:.5f})"
+            step5 = f"✅ Rejet mèche actif sur {tf_entry}"
+            
+        # Scénario B : Bougie de continuation / Breakout d'impulsion sans retest
+        elif is_w and price > neckline and c_close > c_open and body_ratio > 0.6:
+            step4 = f"⚡ CONTINUATION HAUSSIÈRE (Cassure sèche {neckline:.5f})"
+            step5 = f"🔥 Pas de retest : Bougie d'impulsion acheteuse ({tf_entry})"
+            
+        elif is_m and price < neckline and c_close < c_open and body_ratio > 0.6:
+            step4 = f"⚡ CONTINUATION BAISSIÈRE (Cassure sèche {neckline:.5f})"
+            step5 = f"🔥 Pas de retest : Bougie d'impulsion vendeuse ({tf_entry})"
+            
+        elif price < neckline and is_m:
+            step4 = f"⏳ Neckline Cassée (Attente Retest {tf_entry})"
+        elif price > neckline and is_w:
+            step4 = f"⏳ Neckline Cassée (Attente Retest {tf_entry})"
+
+    # 6. TDI Divergence / Filtre 2ème Sommet-Creux dans Baseline
+    step6 = "❌ Standard"
+    if is_m and max2_idx < len(recent_s):
+        if rsi_c <= base_c + 2:
+            step6 = f"🔥 2ème Top filtré sous/dans Baseline TDI ({tf_struct})"
+
+    elif is_w and min2_idx < len(recent_s):
+        if rsi_c >= base_c - 2:
+            step6 = f"🔥 2ème Bottom filtré sur/dans Baseline TDI ({tf_struct})"
+
+    score = sum([step1 != "❌ Non", is_m or is_w, "✅" in step3, "✅" in step4 or "⚡" in step4, "🔥" in step6])
+
+    return {
+        "Paire": symbol,
+        "Score": score,
+        "Biais": bias,
+        "S1_Sweep": f"{step1}",
+        "S2_Pattern": f"{step2}",
+        "S3_RSI_TDI": f"{step3}",
+        "S4_Retest": f"{step4}",
+        "S5_NecklineTest": f"{step5}",
+        "S6_TDI": step6,
+        "Prix": price
+    }
 
 if API_KEY:
-    if st.button("🔄 Lancer le Scan & Envoyer sur Telegram"):
+    if st.button("🔄 Lancer le Scan Chronologique TDI"):
         st.cache_data.clear()
-        
         progress_bar = st.progress(0)
         status_text = st.empty()
         
         results = []
-        alerts = []
+        telegram_alerts = []
         total = len(SYMBOLS)
         
+        tf_struct = MTF_MAP[HTF]["struct_tdi"]
+        tf_entry = MTF_MAP[HTF]["entry"]
+
         for idx, symbol in enumerate(SYMBOLS):
-            status_text.text(f"Analyse en cours ({HTF}) : {symbol} ({idx+1}/{total})...")
-            res = analyze(symbol)
-            results.append(res)
-            
-            if res["Signal"] in ["🚀 ACHAT", "🔻 VENTE"]:
-                alerts.append(f"🔔 *SIGNAL {res['Signal']}*\n• Paire: `{symbol}`\n• Prix: `{res['Prix']}`\n• Pattern: `{res['Pattern LTF']}`\n• Raison: {res['Raison']}")
+            status_text.text(f"Analyse [{HTF} Clôturé -> TDI & Structure sur {tf_struct}] : {symbol} ({idx+1}/{total})...")
+            res = analyze_sequences(symbol)
+            if res:
+                results.append(res)
+                # Alerte Telegram envoyée si au moins la structure W/M est active
+                if res["S2_Pattern"] != "❌ Non":
+                    msg = (
+                        f"📊 *ANALYSE CHRONOLOGIQUE TDI : {symbol}*\n"
+                        f"🎯 Biais : *{res['Biais']}* | Prix : `{res['Prix']}`\n\n"
+                        f"1️⃣ Bougie HTF : {res['S1_Sweep']}\n"
+                        f"2️⃣ Structure : {res['S2_Pattern']}\n"
+                        f"3️⃣ Signal TDI : {res['S3_RSI_TDI']}\n"
+                        f"4️⃣ Zone Retest / Impulsion : {res['S4_Retest']}\n"
+                        f"5️⃣ Action du Prix : {res['S5_NecklineTest']}\n"
+                        f"6️⃣ Filtre TDI : {res['S6_TDI']}\n"
+                    )
+                    telegram_alerts.append(msg)
             
             progress_bar.progress((idx + 1) / total)
             time.sleep(0.3)
             
-        status_text.text("Analyse terminée !")
+        status_text.text("Scan terminé !")
         
-        # Envoi de la notification globale Telegram
-        if alerts:
-            msg = f"⚡ *OPPORTUNITÉS SCANNER ({HTF})* ⚡\n\n" + "\n\n".join(alerts)
-            send_telegram_alert(msg)
-            st.success(f"{len(alerts)} alerte(s) envoyée(s) sur Telegram !")
+        if telegram_alerts:
+            for alert in telegram_alerts:
+                send_telegram_alert(alert)
+                time.sleep(0.5)
+            st.success(f"{len(telegram_alerts)} alerte(s) envoyée(s) sur Telegram !")
         else:
-            send_telegram_alert(f"ℹ️ Scan {HTF} terminé. Aucune opportunité validée pour le moment.")
-            st.info("Scan terminé. Aucune alerte à envoyer.")
+            send_telegram_alert(f"ℹ️ Scan [{HTF} -> {tf_struct}] terminé. Aucune structure M/W active.")
+            st.info("Aucune structure M/W active trouvée pour ce timeframe.")
             
-        st.dataframe(pd.DataFrame(results), use_container_width=True)
+        if results:
+            st.dataframe(pd.DataFrame(results), use_container_width=True)
 else:
-    st.warning("Insère ta clé Twelve Data dans les secrets pour commencer.")
+    st.warning("Clé API Twelve Data manquante dans les Secrets.")
