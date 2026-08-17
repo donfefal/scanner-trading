@@ -8,8 +8,11 @@ st.set_page_config(page_title="Scanner Forex/Crypto", page_icon="📊", layout="
 st.title("📊 Scanner Multi-Timeframe")
 st.caption("Filtres : Sweep HTF + EMA 200/800 + RSI Baseline")
 
+# Récupération automatique de la clé API depuis les Secrets Streamlit ou le champ de saisie
+API_KEY_SECRET = st.secrets.get("TWELVEDATA_API_KEY", "")
+
 st.sidebar.header("⚙️ Configuration")
-API_KEY = st.sidebar.text_input("Clé API Twelve Data", type="password")
+API_KEY = st.sidebar.text_input("Clé API Twelve Data", value=API_KEY_SECRET, type="password")
 SYMBOLS = st.sidebar.multiselect("Paires", ["EUR/USD", "GBP/USD", "XAU/USD", "BTC/USD", "ETH/USD"], default=["EUR/USD", "XAU/USD", "BTC/USD"])
 HTF = st.sidebar.selectbox("Timeframe Supérieur", ["1day", "4h", "1week"])
 
@@ -74,4 +77,4 @@ if API_KEY:
     st.dataframe(pd.DataFrame(data), use_container_width=True)
 else:
     st.warning("Insère ta clé Twelve Data dans le menu à gauche pour afficher les résultats.")
-                  
+    
