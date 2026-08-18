@@ -7,7 +7,7 @@ import time
 st.set_page_config(page_title="Scanner Multi-Séquences MTF", page_icon="📊", layout="wide")
 
 st.title("📊 Scanner Reversal - Alignement HTF, TDI & Double Retest")
-st.caption("Cascade Chronologique : Sweep HTF -> Structure M/W & TDI -> Double Retest (Prix + TDI)")
+st.caption("Cascade Chronologique : Sweep/Rejet HTF -> Structure M/W (Flexible) -> Retest Neckline/EMA200")
 
 # Secrets Streamlit Cloud
 API_KEY = st.secrets.get("TWELVEDATA_API_KEY", "")
@@ -17,7 +17,6 @@ TELEGRAM_CHAT_ID = st.secrets.get("TELEGRAM_CHAT_ID", "")
 st.sidebar.header("⚙️ Configuration HTF")
 HTF = st.sidebar.selectbox("Clôture HTF (Contexte)", ["1month", "1week", "1day", "4h"])
 
-# Mapping exact de la chronologie TDI
 MTF_MAP = {
     "1month": {"struct_tdi": "1day",  "entry": "1h"},
     "1week":  {"struct_tdi": "4h",    "entry": "15min"},
@@ -73,55 +72,70 @@ def analyze_sequences(symbol):
     if df_htf.empty or df_struct.empty or df_entry.empty:
         return None
 
-    # Indicateurs TDI (RSI, Baseline, Signal) et EMA 200 sur le Timeframe de Structure
+    # TDI et EMA200 sur Timeframe de Structure
     df_struct['RSI'] = ta.momentum.rsi(df_struct['close'], window=14)
     df_struct['Base'] = ta.trend.sma_indicator(df_struct['RSI'], window=14)
     df_struct['Signal'] = ta.trend.sma_indicator(df_struct['RSI'], window=2)
     df_struct['EMA200'] = ta.trend.ema_indicator(df_struct['close'], window=200)
 
-    # 1. Clôture Bougie HTF / Sweep
+    # 1. Clôture Bougie HTF / Sweep / Rejet Puissant
     b_prev, b_curr = df_htf.iloc[-2], df_htf.iloc[-1]
     prev_mid = (b_prev['open'] + b_prev['close']) / 2
+    
     swept_low = b_curr['low'] < b_prev['low'] and b_curr['close'] > prev_mid
     swept_high = b_curr['high'] > b_prev['high'] and b_curr['close'] < prev_mid
+    
+    body_curr = abs(b_curr['close'] - b_curr['open'])
+    range_curr = b_curr['high'] - b_curr['low'] if (b_curr['high'] - b_curr['low']) > 0 else 1
+    is_bull_reversal = (b_curr['close'] > b_curr['open']) and (body_curr / range_curr > 0.4)
+    is_bear_reversal = (b_curr['close'] < b_curr['open']) and (body_curr / range_curr > 0.4)
 
-    step1 = f"✅ Clôture/Sweep Bas ({HTF})" if swept_low else (f"✅ Clôture/Sweep Haut ({HTF})" if swept_high else "❌ Non")
-    bias = "ACHAT" if swept_low else ("VENTE" if swept_high else "NEUTRE")
+    if swept_low or is_bull_reversal:
+        step1 = f"✅ Rejet/Retournement Haussier ({HTF})"
+        bias = "ACHAT"
+    elif swept_high or is_bear_reversal:
+        step1 = f"✅ Rejet/Retournement Baissier ({HTF})"
+        bias = "VENTE"
+    else:
+        step1 = "❌ Non"
+        bias = "NEUTRE"
 
-    # 2. Structure M ou W sur le Timeframe de Structure
-    recent_s = df_struct.tail(30).reset_index(drop=True)
+    # 2. Structure M ou W (Tolérance Élargie aux W/M Asymétriques)
+    recent_s = df_struct.tail(35).reset_index(drop=True)
     price = df_entry['close'].iloc[-1]
     
-    max1_idx, max2_idx = recent_s['high'].iloc[:-12].idxmax(), recent_s['high'].iloc[-12:].idxmax()
+    max1_idx, max2_idx = recent_s['high'].iloc[:-10].idxmax(), recent_s['high'].iloc[-10:].idxmax()
     max1, max2 = recent_s['high'].iloc[max1_idx], recent_s['high'].iloc[max2_idx]
     min_between = recent_s['low'].iloc[max1_idx:max2_idx+1].min() if max1_idx < max2_idx else None
 
-    min1_idx, min2_idx = recent_s['low'].iloc[:-12].idxmin(), recent_s['low'].iloc[-12:].idxmin()
+    min1_idx, min2_idx = recent_s['low'].iloc[:-10].idxmin(), recent_s['low'].iloc[-10:].idxmin()
     min1, min2 = recent_s['low'].iloc[min1_idx], recent_s['low'].iloc[min2_idx]
     max_between = recent_s['high'].iloc[min1_idx:min2_idx+1].max() if min1_idx < min2_idx else None
 
-    is_m = (abs(max1 - max2) / max1 < 0.004) and min_between is not None
-    is_w = (abs(min1 - min2) / min1 < 0.004) and max_between is not None
+    # Tolérance élargie à 1.2% pour capter les creux/sommets asymétriques (Sweep)
+    is_m = (abs(max1 - max2) / max1 < 0.012) and min_between is not None
+    is_w = (abs(min1 - min2) / min1 < 0.012) and max_between is not None
 
     step2 = f"M sur {tf_struct}" if is_m else (f"W sur {tf_struct}" if is_w else "❌ Non")
 
-    # 3. TDI : Croisement initial RSI / Baseline
+    # 3. TDI : Croisement RSI/Signal vs Baseline
     rsi_c, base_c, sig_c = df_struct['RSI'].iloc[-1], df_struct['Base'].iloc[-1], df_struct['Signal'].iloc[-1]
     rsi_p, base_p = df_struct['RSI'].iloc[-2], df_struct['Base'].iloc[-2]
     
     rsi_cross_up = (rsi_p <= base_p and rsi_c > base_c)
     rsi_cross_down = (rsi_p >= base_p and rsi_c < base_c)
-    step3 = f"✅ RSI/Signal croisent Baseline HAUSSE" if rsi_cross_up else (f"✅ RSI/Signal croisent Baseline BAISSE" if rsi_cross_down else f"🔄 TDI actif ({rsi_c:.1f}/{base_c:.1f})")
+    step3 = f"✅ TDI Cross-Up" if rsi_cross_up else (f"✅ TDI Cross-Down" if rsi_cross_down else f"🔄 TDI actif ({rsi_c:.1f}/{base_c:.1f})")
 
-    # 4 & 5. Double Retest (Prix sur Neckline + TDI sur Baseline) OU Continuation Sèche
+    # 4 & 5. Retest (Neckline OU EMA 200) + Rejet TDI
     neckline = min_between if is_m else (max_between if is_w else None)
     ema200_val = df_struct['EMA200'].iloc[-1]
     
     step4 = "❌ Non"
     step5 = "❌ Non"
 
-    if neckline:
-        dist_neck = abs(price - neckline) / neckline
+    if neckline or ema200_val:
+        ref_level = neckline if neckline else ema200_val
+        dist_neck = abs(price - neckline) / neckline if neckline else 1.0
         dist_ema = abs(price - ema200_val) / ema200_val if ema200_val else 1.0
 
         c_open = df_entry['open'].iloc[-1]
@@ -130,40 +144,33 @@ def analyze_sequences(symbol):
         c_low = df_entry['low'].iloc[-1]
         body_ratio = abs(c_close - c_open) / (c_high - c_low) if (c_high - c_low) > 0 else 0
 
-        # Test de proximité du TDI avec la Baseline lors du retest
-        tdi_retest = (abs(rsi_c - base_c) <= 6) or (abs(sig_c - base_c) <= 6)
-        ema_confluence = " + EMA200" if dist_ema <= 0.003 else ""
+        tdi_retest = (abs(rsi_c - base_c) <= 7) or (abs(sig_c - base_c) <= 7)
+        at_retest_zone = (dist_neck <= 0.0035) or (dist_ema <= 0.0035)
 
-        # Condition 1 : Setup d'Entrée Complet au Retest
-        if dist_neck <= 0.003 and tdi_retest:
+        if at_retest_zone and tdi_retest:
             is_reversal_candle = (is_w and c_close > c_open) or (is_m and c_close < c_open)
+            retest_target = "EMA 200" if dist_ema <= 0.0035 else f"Neckline ({neckline:.5f})"
             if is_reversal_candle:
-                step4 = f"🎯 SETUP VALIDE : Retest Neckline ({neckline:.5f}){ema_confluence}"
-                step5 = f"🔥 Bougie de retournement clôturée sur {tf_entry} + TDI sur Baseline"
+                step4 = f"🎯 SETUP VALIDE : Retest sur {retest_target}"
+                step5 = f"🔥 Bougie de retournement {tf_entry} + TDI sur Baseline"
             else:
-                step4 = f"⏳ Retest en cours ({neckline:.5f})"
+                step4 = f"⏳ Retest en cours sur {retest_target}"
                 step5 = f"🔄 Attente clôture bougie de retournement ({tf_entry})"
-
-        # Condition 2 : Impulsion Sèche / Bougie de Continuation sans Retest
-        elif is_w and price > neckline and c_close > c_open and body_ratio > 0.6:
-            step4 = f"⚡ CONTINUATION HAUSSIÈRE (Breakout {neckline:.5f}){ema_confluence}"
+        elif is_w and price > ref_level and c_close > c_open and body_ratio > 0.6:
+            step4 = f"⚡ CONTINUATION HAUSSIÈRE (Breakout {ref_level:.5f})"
             step5 = f"🔥 Impulsion forte sans retest sur {tf_entry}"
-        elif is_m and price < neckline and c_close < c_open and body_ratio > 0.6:
-            step4 = f"⚡ CONTINUATION BAISSIÈRE (Breakout {neckline:.5f}){ema_confluence}"
+        elif is_m and price < ref_level and c_close < c_open and body_ratio > 0.6:
+            step4 = f"⚡ CONTINUATION BAISSIÈRE (Breakout {ref_level:.5f})"
             step5 = f"🔥 Impulsion forte sans retest sur {tf_entry}"
-        elif price < neckline and is_m:
-            step4 = f"⏳ Neckline Cassée (Attente Retest sur {tf_entry})"
-        elif price > neckline and is_w:
-            step4 = f"⏳ Neckline Cassée (Attente Retest sur {tf_entry})"
 
-    # 6. Filtre 2ème Sommet/Creux TDI
+    # 6. Filtre TDI 2ème Creux/Sommet
     step6 = "❌ Standard"
     if is_m and max2_idx < len(recent_s):
-        if rsi_c <= base_c + 2:
-            step6 = f"🔥 2ème Top filtré sous/dans Baseline TDI ({tf_struct})"
+        if rsi_c <= base_c + 3:
+            step6 = f"🔥 2ème Top filtré sous Baseline TDI ({tf_struct})"
     elif is_w and min2_idx < len(recent_s):
-        if rsi_c >= base_c - 2:
-            step6 = f"🔥 2ème Bottom filtré sur/dans Baseline TDI ({tf_struct})"
+        if rsi_c >= base_c - 3:
+            step6 = f"🔥 2ème Bottom filtré sur Baseline TDI ({tf_struct})"
 
     score = sum([step1 != "❌ Non", is_m or is_w, "✅" in step3 or "🔄" in step3, "🎯" in step4 or "⚡" in step4, "🔥" in step5, "🔥" in step6])
 
