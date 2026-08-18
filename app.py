@@ -6,8 +6,8 @@ import time
 
 st.set_page_config(page_title="Scanner Multi-Séquences MTF", page_icon="📊", layout="wide")
 
-st.title("📊 Scanner Reversal - Alignement HTF, TDI, EMA 200 & Continuation")
-st.caption("Cascade : Clôture HTF -> Structure M/W & TDI + Support/Résistance EMA 200 -> Retest / Impulsion")
+st.title("📊 Scanner Reversal - Alignement HTF, TDI & Double Retest")
+st.caption("Cascade Chronologique : Sweep HTF -> Structure M/W & TDI -> Double Retest (Prix + TDI)")
 
 # Secrets Streamlit Cloud
 API_KEY = st.secrets.get("TWELVEDATA_API_KEY", "")
@@ -73,9 +73,10 @@ def analyze_sequences(symbol):
     if df_htf.empty or df_struct.empty or df_entry.empty:
         return None
 
-    # Indicateurs TDI et EMA 200 calculés sur le Timeframe de Structure (ex: H1)
+    # Indicateurs TDI (RSI, Baseline, Signal) et EMA 200 sur le Timeframe de Structure
     df_struct['RSI'] = ta.momentum.rsi(df_struct['close'], window=14)
     df_struct['Base'] = ta.trend.sma_indicator(df_struct['RSI'], window=14)
+    df_struct['Signal'] = ta.trend.sma_indicator(df_struct['RSI'], window=2)
     df_struct['EMA200'] = ta.trend.ema_indicator(df_struct['close'], window=200)
 
     # 1. Clôture Bougie HTF / Sweep
@@ -104,15 +105,15 @@ def analyze_sequences(symbol):
 
     step2 = f"M sur {tf_struct}" if is_m else (f"W sur {tf_struct}" if is_w else "❌ Non")
 
-    # 3. TDI : Traversée du RSI sur la Baseline
-    rsi_c, base_c = df_struct['RSI'].iloc[-1], df_struct['Base'].iloc[-1]
+    # 3. TDI : Croisement initial RSI / Baseline
+    rsi_c, base_c, sig_c = df_struct['RSI'].iloc[-1], df_struct['Base'].iloc[-1], df_struct['Signal'].iloc[-1]
     rsi_p, base_p = df_struct['RSI'].iloc[-2], df_struct['Base'].iloc[-2]
     
     rsi_cross_up = (rsi_p <= base_p and rsi_c > base_c)
     rsi_cross_down = (rsi_p >= base_p and rsi_c < base_c)
-    step3 = f"✅ RSI traverse Baseline HAUSSE ({tf_struct})" if rsi_cross_up else (f"✅ RSI traverse Baseline BAISSE ({tf_struct})" if rsi_cross_down else f"🔄 Proche ({rsi_c:.1f}/{base_c:.1f})")
+    step3 = f"✅ RSI/Signal croisent Baseline HAUSSE" if rsi_cross_up else (f"✅ RSI/Signal croisent Baseline BAISSE" if rsi_cross_down else f"🔄 TDI actif ({rsi_c:.1f}/{base_c:.1f})")
 
-    # 4. Retest / Bougie de Continuation + Confluence EMA 200
+    # 4 & 5. Double Retest (Prix sur Neckline + TDI sur Baseline) OU Continuation Sèche
     neckline = min_between if is_m else (max_between if is_w else None)
     ema200_val = df_struct['EMA200'].iloc[-1]
     
@@ -129,34 +130,42 @@ def analyze_sequences(symbol):
         c_low = df_entry['low'].iloc[-1]
         body_ratio = abs(c_close - c_open) / (c_high - c_low) if (c_high - c_low) > 0 else 0
 
-        # Confluence support/résistance EMA 200
-        ema_support = " (EMA 200 Support)" if (dist_ema <= 0.003 and price >= ema200_val) else ""
-        ema_resist = " (EMA 200 Résistance)" if (dist_ema <= 0.003 and price <= ema200_val) else ""
+        # Test de proximité du TDI avec la Baseline lors du retest
+        tdi_retest = (abs(rsi_c - base_c) <= 6) or (abs(sig_c - base_c) <= 6)
+        ema_confluence = " + EMA200" if dist_ema <= 0.003 else ""
 
-        if dist_neck <= 0.002:
-            step4 = f"✅ Retest Neckline ({neckline:.5f}){ema_support if is_w else ema_resist}"
-            step5 = f"✅ Rejet mèche actif sur {tf_entry}"
+        # Condition 1 : Setup d'Entrée Complet au Retest
+        if dist_neck <= 0.003 and tdi_retest:
+            is_reversal_candle = (is_w and c_close > c_open) or (is_m and c_close < c_open)
+            if is_reversal_candle:
+                step4 = f"🎯 SETUP VALIDE : Retest Neckline ({neckline:.5f}){ema_confluence}"
+                step5 = f"🔥 Bougie de retournement clôturée sur {tf_entry} + TDI sur Baseline"
+            else:
+                step4 = f"⏳ Retest en cours ({neckline:.5f})"
+                step5 = f"🔄 Attente clôture bougie de retournement ({tf_entry})"
+
+        # Condition 2 : Impulsion Sèche / Bougie de Continuation sans Retest
         elif is_w and price > neckline and c_close > c_open and body_ratio > 0.6:
-            step4 = f"⚡ CONTINUATION HAUSSIÈRE (Cassure sèche {neckline:.5f}){ema_support}"
-            step5 = f"🔥 Impulsion forte sans retest ({tf_entry})"
+            step4 = f"⚡ CONTINUATION HAUSSIÈRE (Breakout {neckline:.5f}){ema_confluence}"
+            step5 = f"🔥 Impulsion forte sans retest sur {tf_entry}"
         elif is_m and price < neckline and c_close < c_open and body_ratio > 0.6:
-            step4 = f"⚡ CONTINUATION BAISSIÈRE (Cassure sèche {neckline:.5f}){ema_resist}"
-            step5 = f"🔥 Impulsion forte sans retest ({tf_entry})"
+            step4 = f"⚡ CONTINUATION BAISSIÈRE (Breakout {neckline:.5f}){ema_confluence}"
+            step5 = f"🔥 Impulsion forte sans retest sur {tf_entry}"
         elif price < neckline and is_m:
-            step4 = f"⏳ Neckline Cassée (Attente Retest {tf_entry})"
+            step4 = f"⏳ Neckline Cassée (Attente Retest sur {tf_entry})"
         elif price > neckline and is_w:
-            step4 = f"⏳ Neckline Cassée (Attente Retest {tf_entry})"
+            step4 = f"⏳ Neckline Cassée (Attente Retest sur {tf_entry})"
 
-    # 5. TDI Filtre Baseline
+    # 6. Filtre 2ème Sommet/Creux TDI
     step6 = "❌ Standard"
     if is_m and max2_idx < len(recent_s):
         if rsi_c <= base_c + 2:
-            step6 = f"🔥 2ème Top sous/dans Baseline TDI ({tf_struct})"
+            step6 = f"🔥 2ème Top filtré sous/dans Baseline TDI ({tf_struct})"
     elif is_w and min2_idx < len(recent_s):
         if rsi_c >= base_c - 2:
-            step6 = f"🔥 2ème Bottom sur/dans Baseline TDI ({tf_struct})"
+            step6 = f"🔥 2ème Bottom filtré sur/dans Baseline TDI ({tf_struct})"
 
-    score = sum([step1 != "❌ Non", is_m or is_w, "✅" in step3, "✅" in step4 or "⚡" in step4, "🔥" in step6])
+    score = sum([step1 != "❌ Non", is_m or is_w, "✅" in step3 or "🔄" in step3, "🎯" in step4 or "⚡" in step4, "🔥" in step5, "🔥" in step6])
 
     return {
         "Paire": symbol,
@@ -185,7 +194,7 @@ if API_KEY:
         tf_entry = MTF_MAP[HTF]["entry"]
 
         for idx, symbol in enumerate(SYMBOLS):
-            status_text.text(f"Analyse [{HTF} Clôturé -> TDI & Structure sur {tf_struct}] : {symbol} ({idx+1}/{total})...")
+            status_text.text(f"Analyse [{HTF} -> TDI {tf_struct} -> Entrée {tf_entry}] : {symbol} ({idx+1}/{total})...")
             res = analyze_sequences(symbol)
             if res:
                 results.append(res)
@@ -196,8 +205,8 @@ if API_KEY:
                         f"1️⃣ Bougie HTF : {res['S1_Sweep']}\n"
                         f"2️⃣ Structure : {res['S2_Pattern']}\n"
                         f"3️⃣ Signal TDI : {res['S3_RSI_TDI']}\n"
-                        f"4️⃣ Zone Retest / EMA200 : {res['S4_Retest']}\n"
-                        f"5️⃣ Action du Prix : {res['S5_NecklineTest']}\n"
+                        f"4️⃣ Zone Retest / EMA : {res['S4_Retest']}\n"
+                        f"5️⃣ Entrée / Signal : {res['S5_NecklineTest']}\n"
                         f"6️⃣ Filtre TDI : {res['S6_TDI']}\n"
                     )
                     telegram_alerts.append(msg)
@@ -220,4 +229,4 @@ if API_KEY:
             st.dataframe(pd.DataFrame(results), use_container_width=True)
 else:
     st.warning("Clé API Twelve Data manquante dans les Secrets.")
-        
+    
